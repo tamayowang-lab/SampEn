@@ -1,5 +1,7 @@
 # Sample entropy with delay
 
+[Complete guide: build the C library, call it from Python, and reproduce first-correct-versus-latest timings](docs/PYTHON_C_GUIDE.md).
+
 Latest: [further alpha-only tuning and exact-count benchmark](examples/results_alpha_limit/README.md)
 for 180-second, 250 Hz, 64-channel EEG at order 3.
 
