@@ -1,5 +1,5 @@
 import numpy as np
-from numba import jit, types
+from numba import jit, njit, types
 from scipy.signal import periodogram, welch
 from sklearn.neighbors import KDTree
 from scipy.spatial import cKDTree
@@ -14,6 +14,8 @@ def sample_entropy(x, order=2, delay=1, tolerance=None, metric="chebyshev"):
         One-dimensional time series of shape (n_times).
     order : int
         Embedding dimension. Default is 2.
+    delay : int
+        Spacing between template coordinates, in samples. Default is 1.
     tolerance : float
         Tolerance value for acceptance of the template vector. Default is 0.2
         times the standard deviation of x.
@@ -49,12 +51,13 @@ def sample_entropy(x, order=2, delay=1, tolerance=None, metric="chebyshev"):
     vectors of length :math:`m` having a Chebyshev distance inferior to
     :math:`r`.
 
-    Note that if ``metric == 'chebyshev'`` and ``len(x) < 5000`` points,
-    then the sample entropy is computed using a fast custom Numba script.
-    For other distance metric or longer time-series, the sample entropy is
-    computed using a code from the
-    `mne-features <https://mne.tools/mne-features/>`_ package by Jean-Baptiste
-    Schiratti and Alexandre Gramfort (requires sklearn).
+    The KDTree code derives from mne-features by Jean-Baptiste Schiratti and
+    Alexandre Gramfort. This implementation always uses sklearn's KDTree.
+    For a Numba
+    implementation supporting arbitrary delay and Chebyshev distance, use
+    :func:`sample_entropy_numba`. The original denominator removes only one
+    template regardless of delay; the Numba function instead aligns the two
+    template sets. Consequently, results can differ when delay is greater than 1.
 
     References
     ----------
@@ -278,3 +281,80 @@ def _embed(x, order=3, delay=1):
             # append the sliced signal to list
         Y = np.concatenate(Y, axis=-1)
         return Y
+
+
+def sample_entropy_numba(x, order=2, delay=1, tolerance=None):
+    """Compute delay-aware sample entropy with Numba (Chebyshev distance).
+
+    Both template sets use the same ``len(x) - order * delay`` start indices;
+    an order-m template can therefore always be extended to order m+1. Every
+    possible start is included, not just every ``delay``-th sample. Self matches
+    are excluded and distances equal to the tolerance are included. As in
+    :func:`sample_entropy`, return NaN if either match count is zero.
+
+    Unlike the original KDTree function, which drops just one order-m template,
+    this uses aligned template sets for delays greater than one. The functions
+    agree at delay=1, except for floating point rounding.
+
+    Sorting on the first template coordinate prunes pairs outside the radius.
+    Remaining coordinates are checked with early rejection; no pairwise distance
+    matrix is allocated. Worst-case runtime remains quadratic, with linear
+    auxiliary memory. The first call includes JIT compilation; later calls reuse
+    the compiled specialization (also cached on disk).
+
+    Parameters
+    ----------
+    x : array_like
+        Finite, real, one-dimensional signal.
+    order : int
+        Embedding dimension, at least 2.
+    delay : int
+        Positive spacing between coordinates, in samples.
+    tolerance : float or None
+        Nonnegative radius. None uses 0.2 times the population standard deviation.
+    """
+    if isinstance(order, (bool, np.bool_)) or not isinstance(order, (int, np.integer)) or order < 2:
+        raise ValueError("order must be an integer of at least 2")
+    if isinstance(delay, (bool, np.bool_)) or not isinstance(delay, (int, np.integer)) or delay < 1:
+        raise ValueError("delay must be a positive integer")
+    raw = np.asarray(x)
+    if np.iscomplexobj(raw):
+        raise ValueError("x must be real")
+    x = np.ascontiguousarray(raw, dtype=np.float64)
+    if raw.ndim != 1 or not np.all(np.isfinite(x)):
+        raise ValueError("x must be a finite one-dimensional signal")
+    if int(order) * int(delay) > x.size - 2:
+        raise ValueError("at least two extendable templates are required")
+    r = 0.2 * np.std(x, ddof=0) if tolerance is None else float(tolerance)
+    if not np.isfinite(r) or r < 0:
+        raise ValueError("tolerance must be finite and nonnegative")
+    if np.all(x == x[0]):
+        return 0.0
+    return _numba_sampen_delay(x, int(order), int(delay), r)
+
+
+@njit(cache=True)
+def _numba_sampen_delay(x, order, delay, r):
+    """Count unordered, aligned template pairs with a sorted radius sweep."""
+    n = x.size - order * delay
+    indices = np.argsort(x[:n])
+    denominator = 0
+    numerator = 0
+    for left in range(n - 1):
+        i = indices[left]
+        for right in range(left + 1, n):
+            j = indices[right]
+            if x[j] - x[i] > r:
+                break
+            matched = True
+            for k in range(1, order):
+                if abs(x[i + k * delay] - x[j + k * delay]) > r:
+                    matched = False
+                    break
+            if matched:
+                denominator += 1
+                if abs(x[i + order * delay] - x[j + order * delay]) <= r:
+                    numerator += 1
+    if denominator == 0 or numerator == 0:
+        return np.nan
+    return -np.log(numerator / denominator)
