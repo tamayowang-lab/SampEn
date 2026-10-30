@@ -18,12 +18,16 @@ def _library():
                                    ctypes.c_size_t, ctypes.c_size_t, pointer,
                                    ctypes.c_int, ctypes.c_int, pointer]
     lib.sampen_channels.restype = ctypes.c_int
+    if hasattr(lib, 'sampen_channels_counts'):
+        uint_pointer = ctypes.POINTER(ctypes.c_uint64)
+        lib.sampen_channels_counts.argtypes = lib.sampen_channels.argtypes + [uint_pointer, uint_pointer]
+        lib.sampen_channels_counts.restype = ctypes.c_int
     lib.sampen_has_openmp.argtypes = []
     lib.sampen_has_openmp.restype = ctypes.c_int
     return lib
 
 
-def sample_entropy_c(data, order=2, delay=1, tolerance=None, n_jobs=1, algorithm='auto'):
+def sample_entropy_c(data, order=2, delay=1, tolerance=None, n_jobs=1, algorithm='auto', return_counts=False):
     """Return one aligned sample entropy per channel of a (channels, time) array.
 
     Chebyshev distance, inclusive radius, no self matches; both template sets use
@@ -37,9 +41,13 @@ def sample_entropy_c(data, order=2, delay=1, tolerance=None, n_jobs=1, algorithm
     channel across threads. Builds without OpenMP reject n_jobs > 1.
 
     algorithm='auto' uses exact O(N log^2 N) range counting for order=2 and
-    dual-tree counting for higher orders. 'range' requires order=2; 'tree' and
-    'sweep' provide controlled comparisons and have quadratic worst-case time.
-    The range method uses O(N log N) workspace. First call loads the library.
+    prefix-bitset counting for order=3 signals with 32768..65536 samples, and
+    dual-tree counting otherwise. 'range' requires order=2. 'bitset' can be
+    selected explicitly for other sizes/orders. It uses quadratic prefix storage
+    with a small bit-packed constant, so auto restricts the size range.
+    return_counts=True returns (entropy, counts_m, counts_m_plus1); counts are
+    exact uint64 unordered pair counts, with no tolerance-based comparison.
+    First call loads the library.
     Inputs are converted to contiguous float64; no input array is modified.
     """
     for name, value, minimum in [('order', order, 2), ('delay', delay, 1)]:
@@ -65,11 +73,16 @@ def sample_entropy_c(data, order=2, delay=1, tolerance=None, n_jobs=1, algorithm
     radii = np.ascontiguousarray(radii, dtype=np.float64)
     if not np.all(np.isfinite(radii)) or np.any(radii < 0):
         raise ValueError('tolerance must be finite and nonnegative')
-    if algorithm not in ('auto', 'tree', 'sweep', 'range'):
-        raise ValueError("algorithm must be 'auto', 'tree', 'sweep' or 'range'")
+    if not isinstance(return_counts, (bool, np.bool_)):
+        raise ValueError('return_counts must be a boolean')
+    if algorithm not in ('auto', 'tree', 'sweep', 'range', 'bitset'):
+        raise ValueError("algorithm must be 'auto', 'tree', 'sweep', 'range' or 'bitset'")
     if algorithm == 'range' and order != 2:
         raise ValueError("algorithm='range' requires order=2")
-    selected = 'range' if algorithm == 'auto' and order == 2 else 'tree' if algorithm == 'auto' else algorithm
+    if algorithm == 'auto':
+        selected = 'range' if order == 2 else 'bitset' if order == 3 and 32768 <= samples <= 65536 else 'tree'
+    else:
+        selected = algorithm
     cpus = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
     threads = min(channels, cpus if n_jobs == -1 else int(n_jobs))
     lib = _library()
@@ -77,11 +90,21 @@ def sample_entropy_c(data, order=2, delay=1, tolerance=None, n_jobs=1, algorithm
         raise RuntimeError('This C library was built without OpenMP; use n_jobs=1 or rebuild with OpenMP.')
     out = np.empty(channels, dtype=np.float64)
     pointer = ctypes.POINTER(ctypes.c_double)
-    status = lib.sampen_channels(x.ctypes.data_as(pointer), channels, samples, int(order), int(delay),
-                                 radii.ctypes.data_as(pointer), threads, {'tree': 0, 'sweep': 1, 'range': 2}[selected],
-                                 out.ctypes.data_as(pointer))
+    arguments = (x.ctypes.data_as(pointer), channels, samples, int(order), int(delay),
+                 radii.ctypes.data_as(pointer), threads,
+                 {'tree': 0, 'sweep': 1, 'range': 2, 'bitset': 3}[selected], out.ctypes.data_as(pointer))
+    if return_counts:
+        if not hasattr(lib, 'sampen_channels_counts'):
+            raise RuntimeError('Rebuild the C library and restart Python to use return_counts=True.')
+        counts_b = np.empty(channels, dtype=np.uint64)
+        counts_a = np.empty(channels, dtype=np.uint64)
+        uint_pointer = ctypes.POINTER(ctypes.c_uint64)
+        status = lib.sampen_channels_counts(*arguments, counts_b.ctypes.data_as(uint_pointer),
+                                           counts_a.ctypes.data_as(uint_pointer))
+    else:
+        status = lib.sampen_channels(*arguments)
     if status & 2:
         raise ValueError('C backend rejected the input size or values')
     if status:
         raise MemoryError('C backend could not allocate its workspace')
-    return out
+    return (out, counts_b, counts_a) if return_counts else out

@@ -91,3 +91,54 @@ def test_range_tree_agree_on_larger_input():
         np.testing.assert_array_equal(sample_entropy_c(x, delay=delay, n_jobs=4), expected)
     with pytest.raises(ValueError):
         sample_entropy_c(x, order=3, algorithm='range')
+
+
+@pytest.mark.parametrize('templates', [2, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 513])
+def test_bitset_word_and_prefix_boundaries(templates):
+    order,delay=3,7
+    rng=np.random.default_rng(42)
+    n=templates+order*delay
+    x=np.vstack([rng.normal(size=n),rng.integers(-2,3,size=n),np.ones(n)])
+    for radius in [0.,1.]:
+        expected=[]
+        for m in [order,order+1]:
+            counts=[]
+            for ch in x:
+                t=ch[np.arange(templates)[:,None]+np.arange(m)*delay]
+                distances=np.max(np.abs(t[:,None,:]-t[None,:,:]),axis=2)
+                counts.append(np.count_nonzero(np.triu(distances<=radius,k=1)))
+            expected.append(np.array(counts,dtype=np.uint64))
+        for algorithm in ['tree','sweep','bitset']:
+            result,b,a=sample_entropy_c(x,order,delay,radius,algorithm=algorithm,
+                                       return_counts=True,n_jobs=3)
+            np.testing.assert_array_equal(b,expected[0])
+            np.testing.assert_array_equal(a,expected[1])
+
+
+@pytest.mark.parametrize('order',[2,3,5])
+@pytest.mark.parametrize('delay',[1,4,11])
+def test_bitset_counts_match_other_algorithms(order,delay):
+    x=np.random.default_rng(4).normal(size=(4,1000))[:,::2]
+    x.flags.writeable=False
+    radii=np.array([0.,.5,1.,100.])
+    expected=sample_entropy_c(x,order,delay,radii,algorithm='tree',return_counts=True)
+    for threads in [1,4]:
+        for a,b in zip(sample_entropy_c(x,order,delay,radii,algorithm='bitset',
+                                        n_jobs=threads,return_counts=True),expected):
+            np.testing.assert_array_equal(a,b)
+    if order==2:
+        for a,b in zip(sample_entropy_c(x,order,delay,radii,algorithm='range',return_counts=True),expected):
+            np.testing.assert_array_equal(a,b)
+
+
+@pytest.mark.parametrize('r',[np.nextafter(1.,0.),1.,np.nextafter(1.,2.)])
+def test_bitset_exact_radius(r):
+    x=np.tile([0.,1.,2.,0.,1.,3.,2.,1.,0.],80)[None,:]
+    expected=sample_entropy_c(x,3,2,r,algorithm='tree',return_counts=True)
+    for a,b in zip(sample_entropy_c(x,3,2,r,algorithm='bitset',return_counts=True),expected):
+        np.testing.assert_array_equal(a,b)
+
+
+def test_return_counts_validation():
+    with pytest.raises(ValueError):
+        sample_entropy_c(np.ones((2,20)),return_counts='yes')

@@ -102,7 +102,8 @@ one- and two-dimensional Fenwick trees to count matches in the remaining
 coordinates. This avoids enumerating matching pairs: runtime is bounded by
 O(N log² N), with O(N log N) workspace per simultaneously processed channel.
 
-For higher orders, the default uses **exact dual-tree pair counting**. When two
+For order=3 signals with 32,768–65,536 samples, the default now uses the exact
+bitset method described below. Other orders/sizes use **exact dual-tree pair counting**. When two
 bounding boxes are wholly within the radius, it counts all matching pairs at
 once. It shares one tree for both embedding dimensions instead of building two
 trees, and excludes self matches. Its workspace scales with samples × embedding
@@ -160,4 +161,70 @@ gcc -O1 -g -std=c11 -fopenmp -fsanitize=address,undefined \
     -fno-omit-frame-pointer -fno-sanitize-recover=all \
     csrc/sampen.c tests/c_sanitizer.c -lm -o /tmp/sampen-sanitizer
 /tmp/sampen-sanitizer
+```
+
+
+## Faster 180-second, 250 Hz, order-3 EEG
+
+For `(64, 45000)` band-filtered EEG, use the same channel-wise API:
+
+```python
+from sampen_c import sample_entropy_c
+
+# Example: alpha 8–13 Hz, midpoint 10.5 Hz, delay round(250/10.5)=24 samples.
+entropy = sample_entropy_c(eeg_180s, order=3, delay=24, n_jobs=4)
+```
+
+Rebuild with `python build_c.py` after updating, then restart Python if the old
+library was loaded. The automatic backend now chooses **exact prefix bitsets**
+for order=3 with 32,768–65,536 input samples. Templates are sorted by their first
+coordinate, so only a forward radius window needs checking. Neighborhoods in
+the other coordinates are intersected in 64-bit words; population counts produce
+exact unordered match counts. Native POPCNT is runtime-dispatched on supported
+x86 CPUs, with a tested portable fallback. The first-coordinate mask, partial
+word boundaries, exact-radius matches, and partial prefix blocks are all handled
+without approximating distances.
+
+Select `algorithm='bitset'` explicitly for other sizes/orders, or `algorithm='tree'`
+to retain the previous backend. Prefix storage is quadratic with a bit-packed
+constant; at 45,000 samples and order=3 the workspace is roughly 14 MiB per
+simultaneously processed channel. The automatic upper size limit bounds this
+memory use. Worst-case time remains quadratic with word-level parallelism;
+performance depends on the recording and radius.
+
+The benchmark uses 180 seconds, 250 Hz, 64 distinct recorded EEG channels,
+order=3 and the same four threads for both C algorithms. It filters delta 0.5–4,
+theta 4–8, alpha 8–13, beta 13–30 and gamma 30–45 Hz. Delay is an integer number
+of samples, computed as:
+
+```python
+delay = min(round(250 / band_midpoint_hz), int(250 * 0.125))
+```
+
+That gives **31, 31, 24, 12 and 7 samples** respectively. The largest delay is
+124 ms; 32 samples would exceed the 125 ms cap. This cap belongs to the EEG
+workflow; the generic library does not impose a sampling-rate-dependent limit.
+
+[Measured timings, count validation and plot](examples/results_180s/README.md).
+The recording is resampled from its original 300 Hz to match the requested
+250 Hz; the benchmark documents exact filtering and cropping. Preprocessing is
+excluded from the reported entropy runtime.
+
+For reproducibility, you can inspect the **integer counts** directly:
+
+```python
+entropy, counts_m, counts_m_plus1 = sample_entropy_c(
+    eeg_180s, order=3, delay=24, n_jobs=4, return_counts=True
+)
+```
+
+The counts are uint64 arrays of unordered matching pairs, excluding self matches.
+Use exact equality for these counts when comparing algorithms; the final
+floating-point logarithm need not be bit-identical across different platforms.
+
+To repeat the user-specific benchmark after downloading the pinned FIF:
+
+```sh
+python examples/benchmark_180s.py --source /path/to/eeg_resting_8min_300hz.fif
+python examples/summarize_180s.py
 ```

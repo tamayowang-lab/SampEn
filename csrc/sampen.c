@@ -143,7 +143,7 @@ static void count_pairs(const Tree *t, size_t aid, size_t bid, double r,
 }
 
 static int entropy_tree(const double *x, size_t n, size_t order, size_t delay,
-                        double r, double *result) {
+                        double r, double *result, uint64_t *b_out, uint64_t *a_out) {
     size_t dim = order + 1;
     /* Bound all products before allocation, including bounds' 4*n*dim. */
     if (n > SIZE_MAX / sizeof(double) / 4 / dim ||
@@ -163,13 +163,15 @@ static int entropy_tree(const double *x, size_t n, size_t order, size_t delay,
     build_tree(&t, 0, n);
     uint64_t b = 0, a = 0;
     count_pairs(&t, 0, 0, r, 1, 1, &b, &a);
+    if(b_out) *b_out=b;
+    if(a_out) *a_out=a;
     *result = (!a || !b) ? NAN : -log((double)a/(double)b);
     free(t.points); free(t.bounds); free(t.indices); free(t.nodes);
     return 0;
 }
 
 static int entropy_sweep(const double *x, size_t n, size_t order, size_t delay,
-                         double r, double *result) {
+                         double r, double *result, uint64_t *b_out, uint64_t *a_out) {
     if (n > SIZE_MAX/sizeof(Entry)) return 2;
     Entry *entries = malloc(n*sizeof(Entry));
     if (!entries) return 1;
@@ -190,6 +192,8 @@ static int entropy_sweep(const double *x, size_t n, size_t order, size_t delay,
             }
         }
     }
+    if(b_out) *b_out=b;
+    if(a_out) *a_out=a;
     *result = (!a || !b) ? NAN : -log((double)a/(double)b);
     free(entries);
     return 0;
@@ -254,7 +258,7 @@ static int64_t rectangle_prefix(const RangeIndex *index, size_t y, double z, dou
     return result;
 }
 
-static int entropy_range(const double *x, size_t n, size_t delay, double r, double *result) {
+static int entropy_range(const double *x, size_t n, size_t delay, double r, double *result, uint64_t *b_out, uint64_t *a_out) {
     if (n > SIZE_MAX/sizeof(Entry) || n+2 > SIZE_MAX/sizeof(size_t)) return 2;
     Entry *entries=malloc(n*sizeof(Entry));
     double *ys=malloc(n*sizeof(double));
@@ -300,6 +304,8 @@ static int entropy_range(const double *x, size_t n, size_t delay, double r, doub
         a+=(uint64_t)(rectangle_prefix(&index,hi,x[i+2*delay],r)-rectangle_prefix(&index,lo,x[i+2*delay],r));
         range_update(&index,ranks[i],x[i+2*delay],1);
     }
+    if(b_out) *b_out=b;
+    if(a_out) *a_out=a;
     *result=(!a || !b) ? NAN : -log((double)a/(double)b);
     error=0;
 cleanup:
@@ -308,14 +314,120 @@ cleanup:
     return error;
 }
 
+/* Reindex bits by coordinate-0 rank, then count only the contiguous forward
+   radius window. Prefixes every 64 sorted points describe the other coordinate
+   neighborhoods; sparse XOR fixes partial blocks. Word intersections and exact
+   population counts replace candidate-pair enumeration. No self/duplicate pairs. */
+typedef struct { uint64_t b,a; } MatchCounts;
+#define COUNT_NAME count_masks_portable
+#define COUNT_TARGET
+#define COUNT_POP(v) ((uint64_t)__builtin_popcountll(v))
+#include "bitset_count.h"
+#undef COUNT_NAME
+#undef COUNT_TARGET
+#if defined(__x86_64__) && defined(__GNUC__) && !defined(SAMPEN_NO_POPCNT)
+#define COUNT_NAME count_masks_native
+#define COUNT_TARGET __attribute__((target("popcnt")))
+#include "bitset_count.h"
+#undef COUNT_NAME
+#undef COUNT_TARGET
+#endif
+#undef COUNT_POP
+
+static int entropy_bitset(const double *x, size_t n, size_t order, size_t delay,
+                          double r, double *result, uint64_t *b_out, uint64_t *a_out) {
+#ifndef SAMPEN_BITSET_BLOCK
+#define SAMPEN_BITSET_BLOCK 64
+#endif
+    const size_t block=SAMPEN_BITSET_BLOCK, dim=order, words=n/64+(n%64!=0), rows=n/block+1;
+    if (n>UINT32_MAX || n>SIZE_MAX/sizeof(Entry) ||
+        dim>SIZE_MAX/n/sizeof(uint32_t)/2 ||
+        dim>SIZE_MAX/rows/words/sizeof(uint64_t)) return 2;
+    Entry *entries=malloc(n*sizeof(Entry));
+    uint32_t *indices=malloc(dim*n*sizeof(uint32_t));
+    uint32_t *rank0=malloc(n*sizeof(uint32_t)), *first_hi=malloc(n*sizeof(uint32_t));
+    uint32_t *lower=malloc(dim*n*sizeof(uint32_t)), *upper=malloc(dim*n*sizeof(uint32_t));
+    uint64_t *prefix=calloc(dim*rows*words,sizeof(uint64_t));
+    uint64_t *adjust=calloc(dim*words,sizeof(uint64_t));
+    const uint64_t **low=malloc(dim*sizeof(uint64_t*)), **high=malloc(dim*sizeof(uint64_t*));
+    int error=1;
+    if(!entries || !rank0 || !first_hi || !indices || !lower || !upper || !prefix || !adjust || !low || !high) goto cleanup;
+    for(size_t i=0;i<n;++i) entries[i]=(Entry){x[i],i};
+    qsort(entries,n,sizeof(Entry),compare_entry);
+    size_t window_end=0;
+    for(size_t p=0;p<n;++p) {
+        rank0[entries[p].index]=(uint32_t)p;
+        while(window_end<n && !(entries[window_end].value>entries[p].value &&
+              entries[window_end].value-entries[p].value>r)) ++window_end;
+        first_hi[p]=(uint32_t)window_end;
+    }
+    for(size_t k=0;k<dim;++k) {
+        for(size_t i=0;i<n;++i) entries[i]=(Entry){x[i+(k+1)*delay],rank0[i]};
+        qsort(entries,n,sizeof(Entry),compare_entry);
+        size_t lo=0, hi=0;
+        for(size_t p=0;p<n;++p) {
+            while(lo<p && entries[p].value-entries[lo].value>r) ++lo;
+            while(hi<n && !(entries[hi].value>entries[p].value && entries[hi].value-entries[p].value>r)) ++hi;
+            size_t i=entries[p].index;
+            indices[k*n+p]=(uint32_t)i;
+            lower[k*n+i]=(uint32_t)lo;
+            upper[k*n+i]=(uint32_t)hi;
+        }
+        for(size_t row=1;row<rows;++row) {
+            uint64_t *current=prefix+(k*rows+row)*words;
+            const uint64_t *previous=current-words;
+            for(size_t w=0;w<words;++w) current[w]=previous[w];
+            for(size_t p=(row-1)*block;p<row*block;++p) {
+                size_t i=indices[k*n+p]; current[i/64]|=UINT64_C(1)<<(i%64);
+            }
+        }
+    }
+    uint64_t b=0,a=0;
+#if defined(__x86_64__) && defined(__GNUC__) && !defined(SAMPEN_NO_POPCNT)
+    int native=__builtin_cpu_supports("popcnt");
+#endif
+    for(size_t i=0;i+1<n;++i) {
+        size_t end=first_hi[i];
+        if(end<=i+1) continue;
+        size_t first_word=(i+1)/64, last_word=(end-1)/64;
+        for(size_t k=0;k<dim;++k)
+            for(size_t w=first_word;w<=last_word;++w) adjust[k*words+w]=0;
+        for(size_t k=0;k<dim;++k) {
+            size_t lo=lower[k*n+i],hi=upper[k*n+i],lb=lo/block,hb=hi/block;
+            low[k]=prefix+(k*rows+lb)*words;
+            high[k]=prefix+(k*rows+hb)*words;
+            for(size_t p=lb*block;p<lo;++p) {
+                size_t j=indices[k*n+p]; adjust[k*words+j/64]^=UINT64_C(1)<<(j%64);
+            }
+            for(size_t p=hb*block;p<hi;++p) {
+                size_t j=indices[k*n+p]; adjust[k*words+j/64]^=UINT64_C(1)<<(j%64);
+            }
+        }
+        MatchCounts counts;
+#if defined(__x86_64__) && defined(__GNUC__) && !defined(SAMPEN_NO_POPCNT)
+        if(native) counts=count_masks_native(n,i+1,end,order,words,low,high,adjust);
+        else
+#endif
+        counts=count_masks_portable(n,i+1,end,order,words,low,high,adjust);
+        b+=counts.b; a+=counts.a;
+    }
+    if(b_out) *b_out=b;
+    if(a_out) *a_out=a;
+    *result=(!a || !b) ? NAN : -log((double)a/(double)b);
+    error=0;
+cleanup:
+    free(entries); free(rank0); free(first_hi); free(indices); free(lower); free(upper); free(prefix); free(adjust); free(low); free(high);
+    return error;
+}
+
 /* Public ABI: input is contiguous row-major channels x samples; one radius and
    output per channel. Status: 0 success, 1 allocation, 2 invalid/overflow. */
-int sampen_channels(const double *data, size_t channels, size_t samples,
+int sampen_channels_counts(const double *data, size_t channels, size_t samples,
                     size_t order, size_t delay, const double *radii,
-                    int threads, int algorithm, double *out) {
+                    int threads, int algorithm, double *out, uint64_t *b_out, uint64_t *a_out) {
     if (!data || !radii || !out || !channels || samples < 2 || order < 2 ||
         !delay || order > (samples-2)/delay || threads < 1 ||
-        channels > SIZE_MAX/sizeof(double)/samples || (algorithm < 0 || algorithm > 2) || (algorithm == 2 && order != 2)) return 2;
+        channels > SIZE_MAX/sizeof(double)/samples || (algorithm < 0 || algorithm > 3) || (algorithm == 2 && order != 2)) return 2;
     size_t n = samples - order*delay;
     /* Directed pair counts must fit uint64_t. */
     if (n > UINT64_MAX/n) return 2;
@@ -332,13 +444,21 @@ int sampen_channels(const double *data, size_t channels, size_t samples,
             if (x[i] != x[0]) constant = 0;
         }
         if (!finite) { out[ch] = NAN; error |= 2; continue; }
-        if (constant) { out[ch] = 0; continue; }
+        if (constant) { out[ch] = 0; if(b_out) b_out[ch]=(uint64_t)n*(n-1)/2; if(a_out) a_out[ch]=(uint64_t)n*(n-1)/2; continue; }
+        uint64_t *bc=b_out ? b_out+ch : NULL, *ac=a_out ? a_out+ch : NULL;
         int status;
-        if (algorithm == 2) status=entropy_range(x,n,delay,r,&out[ch]);
-        else if (algorithm == 0) status=entropy_tree(x,n,order,delay,r,&out[ch]);
-        else status=entropy_sweep(x,n,order,delay,r,&out[ch]);
+        if (algorithm == 3) status=entropy_bitset(x,n,order,delay,r,&out[ch],bc,ac);
+        else if (algorithm == 2) status=entropy_range(x,n,delay,r,&out[ch],bc,ac);
+        else if (algorithm == 0) status=entropy_tree(x,n,order,delay,r,&out[ch],bc,ac);
+        else status=entropy_sweep(x,n,order,delay,r,&out[ch],bc,ac);
         if (status) out[ch] = NAN;
         error |= status;
     }
     return error;
+}
+
+int sampen_channels(const double *data, size_t channels, size_t samples,
+                    size_t order, size_t delay, const double *radii,
+                    int threads, int algorithm, double *out) {
+    return sampen_channels_counts(data,channels,samples,order,delay,radii,threads,algorithm,out,NULL,NULL);
 }
