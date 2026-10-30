@@ -142,3 +142,34 @@ def test_bitset_exact_radius(r):
 def test_return_counts_validation():
     with pytest.raises(ValueError):
         sample_entropy_c(np.ones((2,20)),return_counts='yes')
+
+
+@pytest.mark.parametrize('templates',[32767,32768,32769,65535,65536,65537])
+def test_rank_signed_boundary_and_simd_limit(templates):
+    delay=7
+    x=np.tile([0.,1.,2.,3.],(templates+3*delay+3)//4)[:templates+3*delay][None,:]
+    expected=[]
+    for m in [3,4]:
+        t=x[0,np.arange(templates)[:,None]+np.arange(m)*delay]
+        _,counts=np.unique(t,axis=0,return_counts=True)
+        expected.append(sum(int(c)*(int(c)-1)//2 for c in counts))
+    entropy,b,a=sample_entropy_c(x,3,delay,0,algorithm='bitset',return_counts=True)
+    np.testing.assert_array_equal(b,[expected[0]])
+    np.testing.assert_array_equal(a,[expected[1]])
+
+
+def test_rank_continuous_large_counts():
+    x=np.random.default_rng(51).normal(size=(1,65536+12))
+    expected=sample_entropy_c(x,3,4,.5,algorithm='tree',return_counts=True)
+    actual=sample_entropy_c(x,3,4,.5,algorithm='bitset',return_counts=True)
+    for a,b in zip(actual,expected):np.testing.assert_array_equal(a,b)
+
+
+@pytest.mark.parametrize('radius',[0.,1.,np.finfo(float).max])
+def test_radix_extremes_signed_zero_and_subnormals(radius):
+    tiny=np.nextafter(0.,1.)
+    values=[-np.finfo(float).max,-tiny,-0.,0.,tiny,np.finfo(float).max]
+    x=np.tile(values,100)[None,:]
+    expected=sample_entropy_c(x,3,7,radius,algorithm='tree',return_counts=True)
+    observed=sample_entropy_c(x,3,7,radius,algorithm='bitset',return_counts=True)
+    for a,b in zip(observed,expected):np.testing.assert_array_equal(a,b)

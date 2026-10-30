@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 int main(void) {
-    enum { channels = 6, samples = 257 };
+    enum { channels = 6, samples = 513 };
     double *x = malloc(channels*samples*sizeof(double));
     assert(x);
     double radii[channels], tree[channels], sweep[channels], parallel[channels], range[channels],bitset[channels];

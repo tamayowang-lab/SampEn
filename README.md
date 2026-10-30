@@ -1,5 +1,8 @@
 # Sample entropy with delay
 
+Latest: [alpha-only speed and exact-count benchmark](examples/results_alpha/README.md)
+for 180-second, 250 Hz, 64-channel EEG at order 3.
+
 `SampEn_utils.py` provides the original KDTree implementation and a new,
 delay-aware Numba implementation for **Chebyshev distance**:
 
@@ -181,14 +184,15 @@ for order=3 with 32,768–65,536 input samples. Templates are sorted by their fi
 coordinate, so only a forward radius window needs checking. Neighborhoods in
 the other coordinates are intersected in 64-bit words; population counts produce
 exact unordered match counts. Native POPCNT is runtime-dispatched on supported
-x86 CPUs, with a tested portable fallback. The first-coordinate mask, partial
+x86 CPUs, with a tested portable fallback. AVX2-capable CPUs now build masks
+directly from exact ordinal ranks, reducing both runtime and prefix storage. The first-coordinate mask, partial
 word boundaries, exact-radius matches, and partial prefix blocks are all handled
 without approximating distances.
 
 Select `algorithm='bitset'` explicitly for other sizes/orders, or `algorithm='tree'`
-to retain the previous backend. Prefix storage is quadratic with a bit-packed
-constant; at 45,000 samples and order=3 the workspace is roughly 14 MiB per
-simultaneously processed channel. The automatic upper size limit bounds this
+to retain the previous backend. The prefix fallback has quadratic, bit-packed storage; at 45,000 samples and
+order=3 it uses roughly 14 MiB per simultaneously processed channel. The AVX2
+rank path uses substantially less workspace. The automatic upper size limit bounds this
 memory use. Worst-case time remains quadratic with word-level parallelism;
 performance depends on the recording and radius.
 
@@ -228,3 +232,32 @@ To repeat the user-specific benchmark after downloading the pinned FIF:
 python examples/benchmark_180s.py --source /path/to/eeg_resting_8min_300hz.fif
 python examples/summarize_180s.py
 ```
+
+
+## Latest optimization: alpha only
+
+The latest measured update targets alpha 8–13 Hz only, preserving 180 seconds,
+250 Hz, 64 channels, order=3, tolerance=0.2 × each channel SD, and a 24-sample
+(96 ms) delay. It compares the previous released C library against the new one
+in randomized order through the same wrapper and four threads.
+
+[Full comparison, individual timings, exact counts and plot](examples/results_alpha/README.md).
+
+The optimized implementation reuses one signal sort across delayed coordinates,
+uses exact radix sorting for supported finite IEEE doubles, and constructs
+neighborhood masks with runtime-dispatched AVX2 integer rank comparisons. The
+16-bit representation is of **ordinal ranks**, not quantized EEG amplitudes;
+floating-point distance/radius boundaries remain unchanged. No signal samples
+or template starts are removed. Unsupported CPUs and larger template sets retain
+the portable prefix-bitset implementation.
+
+Update, run `python build_c.py`, and restart Python if the old library was loaded.
+The call stays the same:
+
+```python
+entropy = sample_entropy_c(eeg, order=3, delay=24, n_jobs=4)
+```
+
+Further empirical performance comparisons use `examples/benchmark_alpha.py`;
+the older five-band scripts/results are retained for historical reproducibility.
+Correctness and memory-safety tests still cover other supported parameter sets.

@@ -41,10 +41,12 @@ def sample_entropy_c(data, order=2, delay=1, tolerance=None, n_jobs=1, algorithm
     channel across threads. Builds without OpenMP reject n_jobs > 1.
 
     algorithm='auto' uses exact O(N log^2 N) range counting for order=2 and
-    prefix-bitset counting for order=3 signals with 32768..65536 samples, and
-    dual-tree counting otherwise. 'range' requires order=2. 'bitset' can be
-    selected explicitly for other sizes/orders. It uses quadratic prefix storage
-    with a small bit-packed constant, so auto restricts the size range.
+    bit-mask counting for order=3 signals with 32768..65536 samples, and
+    dual-tree counting otherwise. AVX2-capable x86 CPUs can form masks directly
+    from exact 16-bit ordinal ranks, with linear workspace; other cases retain
+    the portable prefix-bitset path. 'range' requires order=2. 'bitset' can be
+    selected explicitly for other sizes/orders. The prefix fallback has quadratic
+    bit-packed storage, so auto restricts the size range.
     return_counts=True returns (entropy, counts_m, counts_m_plus1); counts are
     exact uint64 unordered pair counts, with no tolerance-based comparison.
     First call loads the library.

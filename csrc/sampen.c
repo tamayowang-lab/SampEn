@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <float.h>
+#include <string.h>
 #include "sampen.h"
 #ifdef _OPENMP
 #include <omp.h>
@@ -314,6 +316,109 @@ cleanup:
     return error;
 }
 
+/* Sort finite IEEE binary64 entries by an order-preserving integer key.
+   This changes only ordering, never the signal values or radius comparison.
+   Other double formats, small arrays and allocation failures use qsort. */
+static void sort_radius_entries(Entry *entries,size_t n) {
+#if DBL_MANT_DIG == 53 && DBL_MAX_EXP == 1024 && !defined(SAMPEN_NO_RADIX) && \
+    defined(__BYTE_ORDER__) && defined(__FLOAT_WORD_ORDER__) && __BYTE_ORDER__ == __FLOAT_WORD_ORDER__
+    if(sizeof(double)==sizeof(uint64_t) && n>=512) {
+        Entry *temporary=malloc(n*sizeof(Entry));
+        if(temporary) {
+            size_t histogram[8][256]={{0}};
+            for(size_t i=0;i<n;++i) {
+                uint64_t bits;
+                memcpy(&bits,&entries[i].value,sizeof(bits));
+                uint64_t key=(bits>>63) ? ~bits : bits^UINT64_C(0x8000000000000000);
+                for(unsigned pass=0;pass<8;++pass) ++histogram[pass][(key>>(8*pass))&255];
+            }
+            Entry *source=entries,*destination=temporary;
+            for(unsigned pass=0;pass<8;++pass) {
+                size_t total=0,nonempty=0;
+                for(size_t bucket=0;bucket<256;++bucket) {
+                    size_t count=histogram[pass][bucket];
+                    if(count) ++nonempty;
+                    histogram[pass][bucket]=total;
+                    total+=count;
+                }
+                if(nonempty<=1) continue;
+                for(size_t i=0;i<n;++i) {
+                    uint64_t bits;
+                    memcpy(&bits,&source[i].value,sizeof(bits));
+                    uint64_t key=(bits>>63) ? ~bits : bits^UINT64_C(0x8000000000000000);
+                    size_t bucket=(key>>(8*pass))&255;
+                    destination[histogram[pass][bucket]++]=source[i];
+                }
+                Entry *swap=source;source=destination;destination=swap;
+            }
+            if(source!=entries) memcpy(entries,source,n*sizeof(Entry));
+            free(temporary);
+            return;
+        }
+    }
+#endif
+    qsort(entries,n,sizeof(Entry),compare_entry);
+}
+
+/* Coordinates are shifted views of one signal. Reuse one full-signal sort
+   when that costs no more than two template sorts; retain a small-n fallback. */
+static int prepare_radius_views(const double *x,size_t n,size_t order,size_t delay,double r,
+        uint32_t *first_hi,uint32_t *lower,uint32_t *upper,uint32_t *indices,
+        int16_t *ranks,size_t padded) {
+    size_t total=n+order*delay;
+    int shared=order*delay<=n && total<=SIZE_MAX/sizeof(Entry);
+    Entry *entries=malloc(n*sizeof(Entry)),*global=NULL;
+    uint32_t *rank0=malloc(n*sizeof(uint32_t));
+    int error=1;
+    if(!entries || !rank0) goto cleanup;
+    if(shared) {
+        global=malloc(total*sizeof(Entry));
+        if(!global) goto cleanup;
+        for(size_t i=0;i<total;++i) global[i]=(Entry){x[i],i};
+        sort_radius_entries(global,total);
+        size_t p=0;
+        for(size_t i=0;i<total;++i) if(global[i].index<n) entries[p++]=global[i];
+    } else {
+        for(size_t i=0;i<n;++i) entries[i]=(Entry){x[i],i};
+        sort_radius_entries(entries,n);
+    }
+    size_t end=0;
+    for(size_t p=0;p<n;++p) {
+        rank0[entries[p].index]=(uint32_t)p;
+        while(end<n && !(entries[end].value>entries[p].value &&
+              entries[end].value-entries[p].value>r)) ++end;
+        first_hi[p]=(uint32_t)end;
+    }
+    for(size_t k=0;k<order;++k) {
+        size_t offset=(k+1)*delay;
+        if(shared) {
+            size_t p=0;
+            for(size_t i=0;i<total;++i) {
+                size_t original=global[i].index;
+                if(original>=offset && original-offset<n)
+                    entries[p++]=(Entry){global[i].value,rank0[original-offset]};
+            }
+        } else {
+            for(size_t i=0;i<n;++i) entries[i]=(Entry){x[i+offset],rank0[i]};
+            sort_radius_entries(entries,n);
+        }
+        size_t lo=0,hi=0;
+        for(size_t p=0;p<n;++p) {
+            while(lo<p && entries[p].value-entries[lo].value>r) ++lo;
+            while(hi<n && !(entries[hi].value>entries[p].value && entries[hi].value-entries[p].value>r)) ++hi;
+            size_t i=entries[p].index;
+            if(indices) indices[k*n+p]=(uint32_t)i;
+            if(ranks) ranks[k*padded+i]=(int16_t)((int32_t)p-32768);
+            lower[k*n+i]=(uint32_t)lo;
+            upper[k*n+i]=(uint32_t)hi;
+        }
+    }
+    error=0;
+cleanup:
+    free(entries);free(global);free(rank0);
+    return error;
+}
+
 /* Reindex bits by coordinate-0 rank, then count only the contiguous forward
    radius window. Prefixes every 64 sorted points describe the other coordinate
    neighborhoods; sparse XOR fixes partial blocks. Word intersections and exact
@@ -334,45 +439,33 @@ typedef struct { uint64_t b,a; } MatchCounts;
 #endif
 #undef COUNT_POP
 
+#include "rank_count.h"
+
 static int entropy_bitset(const double *x, size_t n, size_t order, size_t delay,
                           double r, double *result, uint64_t *b_out, uint64_t *a_out) {
 #ifndef SAMPEN_BITSET_BLOCK
 #define SAMPEN_BITSET_BLOCK 64
 #endif
+#if defined(__x86_64__) && defined(__GNUC__) && !defined(SAMPEN_NO_POPCNT) && !defined(SAMPEN_NO_SIMD)
+    if(order==3 && n<=65536 && order*delay<=n &&
+       __builtin_cpu_supports("avx2") && __builtin_cpu_supports("popcnt"))
+        return entropy_rank(x,n,delay,r,result,b_out,a_out);
+#endif
     const size_t block=SAMPEN_BITSET_BLOCK, dim=order, words=n/64+(n%64!=0), rows=n/block+1;
     if (n>UINT32_MAX || n>SIZE_MAX/sizeof(Entry) ||
         dim>SIZE_MAX/n/sizeof(uint32_t)/2 ||
         dim>SIZE_MAX/rows/words/sizeof(uint64_t)) return 2;
-    Entry *entries=malloc(n*sizeof(Entry));
     uint32_t *indices=malloc(dim*n*sizeof(uint32_t));
-    uint32_t *rank0=malloc(n*sizeof(uint32_t)), *first_hi=malloc(n*sizeof(uint32_t));
+    uint32_t *first_hi=malloc(n*sizeof(uint32_t));
     uint32_t *lower=malloc(dim*n*sizeof(uint32_t)), *upper=malloc(dim*n*sizeof(uint32_t));
     uint64_t *prefix=calloc(dim*rows*words,sizeof(uint64_t));
     uint64_t *adjust=calloc(dim*words,sizeof(uint64_t));
     const uint64_t **low=malloc(dim*sizeof(uint64_t*)), **high=malloc(dim*sizeof(uint64_t*));
     int error=1;
-    if(!entries || !rank0 || !first_hi || !indices || !lower || !upper || !prefix || !adjust || !low || !high) goto cleanup;
-    for(size_t i=0;i<n;++i) entries[i]=(Entry){x[i],i};
-    qsort(entries,n,sizeof(Entry),compare_entry);
-    size_t window_end=0;
-    for(size_t p=0;p<n;++p) {
-        rank0[entries[p].index]=(uint32_t)p;
-        while(window_end<n && !(entries[window_end].value>entries[p].value &&
-              entries[window_end].value-entries[p].value>r)) ++window_end;
-        first_hi[p]=(uint32_t)window_end;
-    }
+    if(!first_hi || !indices || !lower || !upper || !prefix || !adjust || !low || !high) goto cleanup;
+    error=prepare_radius_views(x,n,order,delay,r,first_hi,lower,upper,indices,NULL,0);
+    if(error) goto cleanup;
     for(size_t k=0;k<dim;++k) {
-        for(size_t i=0;i<n;++i) entries[i]=(Entry){x[i+(k+1)*delay],rank0[i]};
-        qsort(entries,n,sizeof(Entry),compare_entry);
-        size_t lo=0, hi=0;
-        for(size_t p=0;p<n;++p) {
-            while(lo<p && entries[p].value-entries[lo].value>r) ++lo;
-            while(hi<n && !(entries[hi].value>entries[p].value && entries[hi].value-entries[p].value>r)) ++hi;
-            size_t i=entries[p].index;
-            indices[k*n+p]=(uint32_t)i;
-            lower[k*n+i]=(uint32_t)lo;
-            upper[k*n+i]=(uint32_t)hi;
-        }
         for(size_t row=1;row<rows;++row) {
             uint64_t *current=prefix+(k*rows+row)*words;
             const uint64_t *previous=current-words;
@@ -416,7 +509,7 @@ static int entropy_bitset(const double *x, size_t n, size_t order, size_t delay,
     *result=(!a || !b) ? NAN : -log((double)a/(double)b);
     error=0;
 cleanup:
-    free(entries); free(rank0); free(first_hi); free(indices); free(lower); free(upper); free(prefix); free(adjust); free(low); free(high);
+    free(first_hi); free(indices); free(lower); free(upper); free(prefix); free(adjust); free(low); free(high);
     return error;
 }
 
