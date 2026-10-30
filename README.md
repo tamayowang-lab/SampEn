@@ -20,6 +20,7 @@ Tested with Python 3.12 on Linux. From this checkout:
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements-dev.txt
+python build_c.py
 python -m pytest -q
 python examples/benchmark_resting_eeg.py
 python examples/summarize_benchmark.py
@@ -66,3 +67,97 @@ helper is compared only at delay=1. Runtime depends on signal length, order,
 delay, tolerance and data distribution; a C rewrite alone would not remove those
 algorithmic tradeoffs. This implementation does not silently select a backend
 using an unverified fixed-length threshold.
+
+
+## C backend: channels × time
+
+The C backend computes one entropy per EEG channel, with the same correct
+alignment as `sample_entropy_numba`. Build on Linux with GCC and OpenMP:
+
+```sh
+python build_c.py
+```
+
+```python
+import numpy as np
+from sampen_c import sample_entropy_c
+
+# Shape: (n_channels, n_times). Each channel gets its own default radius.
+eeg = np.load('examples/data/resting_eeg.npz', allow_pickle=False)['data']
+sampen = sample_entropy_c(eeg, order=2, delay=4, n_jobs=4)
+print(sampen)  # shape (n_channels,)
+```
+
+`tolerance=None` uses 0.2 × each channel's population standard deviation.
+You can supply one scalar radius for every channel, or one radius per channel.
+Input is converted to contiguous float64 and left unmodified. The C call releases
+the Python GIL. `n_jobs=1` is serial; positive values parallelize independent
+channels using OpenMP. `n_jobs=-1` uses CPU affinity, capped at the channel count;
+use an explicit count if a container's CPU quota is smaller than its affinity.
+A single channel is processed by one thread regardless of `n_jobs`.
+
+The default `algorithm='auto'` uses an **exact range counter** for `order=2`.
+It sorts the first template coordinate, sweeps a radius window, and uses dynamic
+one- and two-dimensional Fenwick trees to count matches in the remaining
+coordinates. This avoids enumerating matching pairs: runtime is bounded by
+O(N log² N), with O(N log N) workspace per simultaneously processed channel.
+
+For higher orders, the default uses **exact dual-tree pair counting**. When two
+bounding boxes are wholly within the radius, it counts all matching pairs at
+once. It shares one tree for both embedding dimensions instead of building two
+trees, and excludes self matches. Its workspace scales with samples × embedding
+dimension; its worst-case runtime remains quadratic.
+
+`algorithm='range'` explicitly selects the order-2 range method; `algorithm='tree'`
+selects dual-tree counting for any supported order. `algorithm='sweep'` provides
+a direct C counterpart of the Numba sorted-radius sweep to separate language
+effects from algorithm effects. No backend uses approximate search or fast-math.
+All return the same aligned result within floating-point rounding.
+
+The shared library `_sampen_c.so` is a local build output, not committed. Rebuild
+after changing C source and restart Python if the old library was already loaded. `python build_c.py --no-openmp` builds a serial version;
+parallel calls then raise an informative error. Build failures preserve compiler
+errors and return a nonzero exit status. Python requires only NumPy to use the
+C wrapper. The standalone C interface is declared in `csrc/sampen.h`.
+
+### Empirical channel-wise benchmark
+
+[Batch timings and plots](examples/results_channelwise/README.md) compare C with
+serial and parallel Numba and the aligned KDTree implementation. Numba's parallel
+baseline uses a compiled `prange` channel loop, rather than Python threads held
+back by the GIL. Both parallel baselines use the same thread count as C.
+Times include validation, radius calculation, allocations and tree construction;
+Numba compilation and warm-up are excluded.
+
+Run a small offline comparison using the included excerpt:
+
+```sh
+python examples/benchmark_channelwise.py --output /tmp/sampen-quick
+```
+
+For the full long-recording/many-channel benchmark, download the pinned FIF from
+[the data provenance page](examples/data/README.md), then run:
+
+```sh
+curl --fail --location \
+  https://raw.githubusercontent.com/neuropsychology/NeuroKit/ff419d983568ef492eb8d229af643c0ef0100b32/data/eeg_resting_8min_300hz.fif \
+  --output /tmp/eeg_resting_8min_300hz.fif
+python examples/benchmark_channelwise.py --source /tmp/eeg_resting_8min_300hz.fif
+python examples/summarize_channelwise.py
+```
+
+The full benchmark verifies the original recording's SHA-256. It uses genuinely
+distinct recorded channels, not copies of a single channel. This is one recording
+at order=2 and delay=4, so performance claims do not extend to all parameter sets
+or EEG recordings.
+
+For additional native-code checks:
+
+```sh
+python build_c.py --sanitize --output /tmp/sampen-ubsan.so
+SAMPEN_C_LIBRARY=/tmp/sampen-ubsan.so python -m pytest tests/test_sampen_c.py -q
+gcc -O1 -g -std=c11 -fopenmp -fsanitize=address,undefined \
+    -fno-omit-frame-pointer -fno-sanitize-recover=all \
+    csrc/sampen.c tests/c_sanitizer.c -lm -o /tmp/sampen-sanitizer
+/tmp/sampen-sanitizer
+```
