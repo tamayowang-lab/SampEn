@@ -360,48 +360,88 @@ static void sort_radius_entries(Entry *entries,size_t n) {
     qsort(entries,n,sizeof(Entry),compare_entry);
 }
 
+/* One full-signal radius sweep, then prefix counts restrict the same exact
+   bounds to each delayed coordinate's valid sample interval. This avoids
+   repeating floating-point boundary searches and copying sorted entries. */
+static int prepare_shared_radius_views(const double *x,size_t n,size_t order,size_t delay,double r,
+        uint32_t *first_hi,uint32_t *lower,uint32_t *upper,uint32_t *indices,
+        int16_t *ranks,size_t padded) {
+    size_t total=n+order*delay;
+    Entry *global=malloc(total*sizeof(Entry));
+    uint32_t *global_lo=malloc(total*sizeof(uint32_t)),*global_hi=malloc(total*sizeof(uint32_t));
+    uint32_t *prefix=malloc((total+1)*sizeof(uint32_t)),*rank0=malloc(n*sizeof(uint32_t));
+    int error=1;
+    if(!global || !global_lo || !global_hi || !prefix || !rank0) goto cleanup;
+    for(size_t i=0;i<total;++i) global[i]=(Entry){x[i],i};
+    sort_radius_entries(global,total);
+    size_t lo=0,hi=0;
+    prefix[0]=0;
+    for(size_t p=0;p<total;++p) {
+        while(hi<total && global[hi].value-global[p].value<=r) ++hi;
+        global_hi[p]=(uint32_t)hi;
+        /* Symmetry: j is below the radius iff its upper endpoint is <= p.
+           hi[p] includes p itself, so only initialized endpoints are read. */
+        while(global_hi[lo]<=p) ++lo;
+        global_lo[p]=(uint32_t)lo;
+        size_t original=global[p].index;
+        int valid=original<n;
+        prefix[p+1]=prefix[p]+valid;
+        if(valid) rank0[original]=prefix[p];
+    }
+    for(size_t p=0;p<total;++p) {
+        size_t original=global[p].index;
+        if(original<n) first_hi[rank0[original]]=prefix[global_hi[p]];
+    }
+    for(size_t k=0;k<order;++k) {
+        size_t offset=(k+1)*delay;
+        prefix[0]=0;
+        for(size_t p=0;p<total;++p) {
+            size_t original=global[p].index;
+            prefix[p+1]=prefix[p]+(original>=offset && original-offset<n);
+        }
+        for(size_t p=0;p<total;++p) {
+            size_t original=global[p].index;
+            if(original>=offset && original-offset<n) {
+                size_t i=rank0[original-offset],position=prefix[p];
+                if(indices) indices[k*n+position]=(uint32_t)i;
+                if(ranks) ranks[k*padded+i]=(int16_t)((int32_t)position-32768);
+                lower[k*n+i]=prefix[global_lo[p]];
+                upper[k*n+i]=prefix[global_hi[p]];
+            }
+        }
+    }
+    error=0;
+cleanup:
+    free(global);free(global_lo);free(global_hi);free(prefix);free(rank0);
+    return error;
+}
+
 /* Coordinates are shifted views of one signal. Reuse one full-signal sort
    when that costs no more than two template sorts; retain a small-n fallback. */
 static int prepare_radius_views(const double *x,size_t n,size_t order,size_t delay,double r,
         uint32_t *first_hi,uint32_t *lower,uint32_t *upper,uint32_t *indices,
         int16_t *ranks,size_t padded) {
     size_t total=n+order*delay;
-    int shared=order*delay<=n && total<=SIZE_MAX/sizeof(Entry);
-    Entry *entries=malloc(n*sizeof(Entry)),*global=NULL;
+    if(order*delay<=n && total<=SIZE_MAX/sizeof(Entry) && total<=UINT32_MAX &&
+       prepare_shared_radius_views(x,n,order,delay,r,first_hi,lower,upper,indices,ranks,padded)==0) return 0;
+    /* Very sparse embeddings or a failed optional allocation keep the original
+       per-coordinate construction, which needs less temporary memory. */
+    Entry *entries=malloc(n*sizeof(Entry));
     uint32_t *rank0=malloc(n*sizeof(uint32_t));
     int error=1;
     if(!entries || !rank0) goto cleanup;
-    if(shared) {
-        global=malloc(total*sizeof(Entry));
-        if(!global) goto cleanup;
-        for(size_t i=0;i<total;++i) global[i]=(Entry){x[i],i};
-        sort_radius_entries(global,total);
-        size_t p=0;
-        for(size_t i=0;i<total;++i) if(global[i].index<n) entries[p++]=global[i];
-    } else {
-        for(size_t i=0;i<n;++i) entries[i]=(Entry){x[i],i};
-        sort_radius_entries(entries,n);
-    }
+    for(size_t i=0;i<n;++i) entries[i]=(Entry){x[i],i};
+    sort_radius_entries(entries,n);
     size_t end=0;
     for(size_t p=0;p<n;++p) {
         rank0[entries[p].index]=(uint32_t)p;
-        while(end<n && !(entries[end].value>entries[p].value &&
-              entries[end].value-entries[p].value>r)) ++end;
+        while(end<n && !(entries[end].value>entries[p].value && entries[end].value-entries[p].value>r)) ++end;
         first_hi[p]=(uint32_t)end;
     }
     for(size_t k=0;k<order;++k) {
         size_t offset=(k+1)*delay;
-        if(shared) {
-            size_t p=0;
-            for(size_t i=0;i<total;++i) {
-                size_t original=global[i].index;
-                if(original>=offset && original-offset<n)
-                    entries[p++]=(Entry){global[i].value,rank0[original-offset]};
-            }
-        } else {
-            for(size_t i=0;i<n;++i) entries[i]=(Entry){x[i+offset],rank0[i]};
-            sort_radius_entries(entries,n);
-        }
+        for(size_t i=0;i<n;++i) entries[i]=(Entry){x[i+offset],rank0[i]};
+        sort_radius_entries(entries,n);
         size_t lo=0,hi=0;
         for(size_t p=0;p<n;++p) {
             while(lo<p && entries[p].value-entries[lo].value>r) ++lo;
@@ -415,7 +455,7 @@ static int prepare_radius_views(const double *x,size_t n,size_t order,size_t del
     }
     error=0;
 cleanup:
-    free(entries);free(global);free(rank0);
+    free(entries);free(rank0);
     return error;
 }
 
@@ -448,8 +488,9 @@ static int entropy_bitset(const double *x, size_t n, size_t order, size_t delay,
 #endif
 #if defined(__x86_64__) && defined(__GNUC__) && !defined(SAMPEN_NO_POPCNT) && !defined(SAMPEN_NO_SIMD)
     if(order==3 && n<=65536 && order*delay<=n &&
-       __builtin_cpu_supports("avx2") && __builtin_cpu_supports("popcnt"))
+       __builtin_cpu_supports("avx2") && __builtin_cpu_supports("popcnt")) {
         return entropy_rank(x,n,delay,r,result,b_out,a_out);
+    }
 #endif
     const size_t block=SAMPEN_BITSET_BLOCK, dim=order, words=n/64+(n%64!=0), rows=n/block+1;
     if (n>UINT32_MAX || n>SIZE_MAX/sizeof(Entry) ||

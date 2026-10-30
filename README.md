@@ -1,6 +1,6 @@
 # Sample entropy with delay
 
-Latest: [alpha-only speed and exact-count benchmark](examples/results_alpha/README.md)
+Latest: [further alpha-only tuning and exact-count benchmark](examples/results_alpha_limit/README.md)
 for 180-second, 250 Hz, 64-channel EEG at order 3.
 
 `SampEn_utils.py` provides the original KDTree implementation and a new,
@@ -261,3 +261,21 @@ entropy = sample_entropy_c(eeg, order=3, delay=24, n_jobs=4)
 Further empirical performance comparisons use `examples/benchmark_alpha.py`;
 the older five-band scripts/results are retained for historical reproducibility.
 Correctness and memory-safety tests still cover other supported parameter sets.
+
+
+## Further alpha-only tuning
+
+The latest update reuses **radius endpoints** as well as sorting. A single sweep
+in the full sorted signal computes the endpoints; prefix counts map them exactly
+into each delayed coordinate. This removes repeated boundary searches and copied
+coordinate views. The native counter is inlined into the CPU-dispatched channel
+routine. The API and integer match counts are unchanged.
+
+[Fresh comparison against the immediately previous release, including raw timings](examples/results_alpha_limit/README.md).
+The report also records the unsuccessful grouping experiments and explains why
+these measurements do not establish an absolute speed limit.
+
+To compare any selected previous release, `examples/benchmark_alpha.py` now accepts
+`--baseline-commit` alongside `--baseline-lib`. Historical reports and their
+reproduction commands are retained. Performance tests continue to use alpha only;
+correctness and memory-safety checks cover broader supported parameter cases.

@@ -1,6 +1,7 @@
 """Alpha-only interleaved comparison with the previous released C library.
 
-Compile the csrc files from commit 48b4202 separately, then pass --baseline-lib.
+Compile csrc from the selected previous commit separately, then pass
+--baseline-lib and --baseline-commit (default baseline: 48b4202).
 Both libraries are invoked through the same Python wrapper and thread count.
 """
 import argparse
@@ -40,7 +41,7 @@ def previous_wrapper(path):
     return module.sample_entropy_c
 
 
-def benchmark(source,baseline,output,repeats=11,threads=4):
+def benchmark(source,baseline,output,repeats=11,threads=4,baseline_commit='48b42029bc1d384e03cfae4d6d501f1325c8dc0e'):
     if hashlib.sha256(source.read_bytes()).hexdigest()!=SHA256:
         raise ValueError('Source recording SHA-256 mismatch')
     raw=mne.io.read_raw_fif(source,preload=False,verbose='ERROR')
@@ -53,11 +54,12 @@ def benchmark(source,baseline,output,repeats=11,threads=4):
     x=np.ascontiguousarray(sosfiltfilt(sos,full,axis=1)[:,:45000])
     assert x.shape==(64,45000)
     previous=previous_wrapper(baseline)
+    baseline_key=f'previous_release_{baseline_commit[:7]}'
     methods={
-        'previous_release_48b4202':lambda:previous(x,3,24,n_jobs=threads,return_counts=True),
+        baseline_key:lambda:previous(x,3,24,n_jobs=threads,return_counts=True),
         'optimized':lambda:sampen_c.sample_entropy_c(x,3,24,n_jobs=threads,return_counts=True),
     }
-    expected=methods['previous_release_48b4202']()
+    expected=methods[baseline_key]()
     warmed=methods['optimized']()
     for a,b in zip(warmed,expected):np.testing.assert_array_equal(a,b)
     radius=.2*np.std(x[0])
@@ -79,7 +81,7 @@ def benchmark(source,baseline,output,repeats=11,threads=4):
              for method,t in timings.items()}
     output.mkdir(parents=True,exist_ok=True)
     (output/'timings.json').write_text(json.dumps(dict(samples_seconds=timings,summary=summary,
-        speedup=summary['previous_release_48b4202']['median_seconds']/summary['optimized']['median_seconds']),indent=2)+'\n')
+        speedup=summary[baseline_key]['median_seconds']/summary['optimized']['median_seconds']),indent=2)+'\n')
     (output/'counts.json').write_text(json.dumps(dict(entropy=expected[0].tolist(),counts_m=expected[1].tolist(),
         counts_m_plus1=expected[2].tolist(),independent_C3_KDTree_counts=independent),indent=2)+'\n')
     cpuinfo=Path('/proc/cpuinfo')
@@ -90,7 +92,7 @@ def benchmark(source,baseline,output,repeats=11,threads=4):
     metadata=dict(source='NeuroKit resting EEG',source_sha256=SHA256,input_sha256=hashlib.sha256(x.tobytes()).hexdigest(),
                   channels=names,sfreq=250,duration_seconds=180,samples=45000,order=3,delay_samples=24,
                   delay_seconds=.096,max_delay_seconds=.125,band_hz=[8,13],threads=threads,repeats=repeats,
-                  baseline_commit='48b42029bc1d384e03cfae4d6d501f1325c8dc0e',
+                  baseline_commit=baseline_commit,
                   baseline_library_sha256=hashlib.sha256(baseline.read_bytes()).hexdigest(),
                   library_sha256=hashlib.sha256((ROOT/'_sampen_c.so').read_bytes()).hexdigest(),
                   code_sha256={name:hashlib.sha256((ROOT/'csrc'/name).read_bytes()).hexdigest()
@@ -118,9 +120,10 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source',type=Path,required=True)
     parser.add_argument('--baseline-lib',type=Path,required=True)
+    parser.add_argument('--baseline-commit',default='48b42029bc1d384e03cfae4d6d501f1325c8dc0e')
     parser.add_argument('--output',type=Path,default=ROOT/'examples/results_alpha')
     parser.add_argument('--repeats',type=int,default=11)
     parser.add_argument('--threads',type=int,default=4)
     args=parser.parse_args()
     if min(args.repeats,args.threads)<1:parser.error('repeats and threads must be positive')
-    benchmark(args.source,args.baseline_lib,args.output,args.repeats,args.threads)
+    benchmark(args.source,args.baseline_lib,args.output,args.repeats,args.threads,args.baseline_commit)

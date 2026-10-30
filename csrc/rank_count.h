@@ -25,8 +25,8 @@ static inline uint64_t rank_neighborhood(const int16_t *ranks,uint32_t lo,uint32
     return mask;
 }
 
-__attribute__((target("avx2,popcnt")))
-static MatchCounts count_rank_masks(size_t first,size_t end,size_t padded,
+__attribute__((target("avx2,popcnt"),always_inline))
+static inline MatchCounts count_rank_masks(size_t first,size_t end,size_t padded,
         const int16_t *ranks,const uint32_t *lower,const uint32_t *upper) {
     MatchCounts result={0,0};
     size_t begin=first/64,last=(end-1)/64;
@@ -42,6 +42,7 @@ static MatchCounts count_rank_masks(size_t first,size_t end,size_t padded,
     return result;
 }
 
+__attribute__((target("avx2,popcnt")))
 static int entropy_rank(const double *x,size_t n,size_t delay,double r,
         double *result,uint64_t *b_out,uint64_t *a_out) {
     size_t padded=(n/64+(n%64!=0))*64;
